@@ -164,6 +164,9 @@ export class AudioView
     {
         assert (this.audioCtx);
 
+        // Tell the audio thread to release all nodes and connections
+        this.send({ type: 'STOP' });
+
         this.audioWorklet.disconnect();
         this.audioWorklet = null;
 

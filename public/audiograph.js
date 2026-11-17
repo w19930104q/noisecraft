@@ -16,18 +16,28 @@ export class AudioGraph
         // Current playback position in seconds
         this.playPos = 0;
 
-        // Compiled code to generate audio samples
-        this._genSample = null;
+        // Currently active snapshot of the compiled unit.
+        // This is null when no unit is compiled or when
+        // playback is stopped.
+        this.current = null;
 
         // Method to send messages to the main thread
         this.send = send;
 
-        // Stateful audio processing nodes, indexed by nodeId
-        this.nodes = [];
+        // Node creation/disposal counts, useful for
+        // testing and for detecting node leaks
+        this.stats = {
+            nodesCreated: 0,
+            nodesDisposed: 0,
+        };
     }
 
     /**
-     * Update the audio graph given a new compiled unit
+     * Update the audio graph given a new compiled unit.
+     * Builds a new snapshot incrementally, reusing live nodes from the
+     * current snapshot, and then atomically swaps it in. If the build
+     * fails, the current snapshot is left untouched and any nodes
+     * created for the failed snapshot are disposed of.
      */
     newUnit(unit)
     {
@@ -35,48 +45,120 @@ export class AudioGraph
         // currently not listed in the compiled unit, because currently
         // disconnected nodes may get reconnected, and deleting things like
         // delay lines would lose their current state.
-        // All nodes get garbage collected when the playback is stopped.
+        // All nodes get disposed of when the playback is stopped.
 
-        // For each audio node
-        for (let nodeId in unit.nodes)
+        let prevNodes = this.current? this.current.nodes:{};
+
+        // Nodes created for the new snapshot, so they can be
+        // disposed of if the build fails
+        let created = [];
+
+        try
         {
-            let nodeState = unit.nodes[nodeId];
-
-            let nodeClass = (
-                nodeState.type in NODE_CLASSES?
-                NODE_CLASSES[nodeState.type]:
-                AudioNode
+            // Create the sample generation function first, so that a
+            // compilation error leaves the current snapshot untouched
+            // and no stale nodes are left behind
+            let genSample = new Function(
+                'time',
+                'nodes',
+                unit.src
             );
 
-            // If a node with this nodeId is already mapped
-            if (this.nodes[nodeId])
-            {
-                let node = this.nodes[nodeId];
+            // Nodes referenced by the new snapshot, indexed by nodeId
+            let nodes = {};
 
-                // The existing node must have the same type
-                assert (node instanceof nodeClass);
-
-                // Update the node's state
-                node.setState(nodeState);
-            }
-            else
+            // For each audio node in the new unit
+            for (let nodeId in unit.nodes)
             {
-                // Create a new audio node
-                this.nodes[nodeId] = new nodeClass(
-                    nodeId,
-                    nodeState,
-                    this.sampleRate,
-                    this.send
+                let nodeState = unit.nodes[nodeId];
+
+                let nodeClass = (
+                    nodeState.type in NODE_CLASSES?
+                    NODE_CLASSES[nodeState.type]:
+                    AudioNode
                 );
+
+                // If a node with this nodeId already exists
+                if (prevNodes[nodeId])
+                {
+                    let node = prevNodes[nodeId];
+
+                    // The existing node must have the same type
+                    assert (node instanceof nodeClass);
+
+                    // Update the node's state
+                    node.setState(nodeState);
+
+                    // Reuse the existing node
+                    nodes[nodeId] = node;
+                }
+                else
+                {
+                    // Create a new audio node
+                    let node = new nodeClass(
+                        nodeId,
+                        nodeState,
+                        this.sampleRate,
+                        this.send
+                    );
+
+                    created.push(node);
+                    nodes[nodeId] = node;
+                }
             }
+
+            // Carry over existing nodes that are not part of the new
+            // unit so that their state is preserved (see note above)
+            for (let nodeId in prevNodes)
+            {
+                if (!(nodeId in nodes))
+                    nodes[nodeId] = prevNodes[nodeId];
+            }
+
+            // Atomically swap in the new snapshot
+            this.current = new AudioSnapshot(nodes, genSample);
+
+            this.stats.nodesCreated += created.length;
+        }
+        catch (err)
+        {
+            // The build failed, the current snapshot remains active.
+            // Dispose of any nodes created for the failed snapshot
+            // so that no stale nodes are left behind.
+            for (let node of created)
+            {
+                node.dispose();
+                this.stats.nodesDisposed++;
+            }
+
+            throw err;
+        }
+    }
+
+    /**
+     * Stop audio generation and release all nodes and connections
+     */
+    stop()
+    {
+        if (!this.current)
+            return;
+
+        let nodes = this.current.nodes;
+
+        // Detach the current snapshot so no new samples
+        // can be generated from it
+        this.current = null;
+
+        // Dispose of all audio nodes
+        for (let nodeId in nodes)
+        {
+            nodes[nodeId].dispose();
+            this.stats.nodesDisposed++;
         }
 
-        // Create the sample generation function
-        this._genSample = new Function(
-            'time',
-            'nodes',
-            unit.src
-        );
+        // Reset the playback position so the graph
+        // is ready for a fresh start
+        this.playPos = 0;
     }
 
     /**
@@ -84,12 +166,17 @@ export class AudioGraph
      */
     parseMsg(msg)
     {
-        let node = ('nodeId' in msg)? this.nodes[msg.nodeId]:null;
+        let nodes = this.current? this.current.nodes:{};
+        let node = ('nodeId' in msg)? nodes[msg.nodeId]:null;
 
         switch (msg.type)
         {
             case 'NEW_UNIT':
             this.newUnit(msg.unit);
+            break;
+
+            case 'STOP':
+            this.stop();
             break;
 
             case 'SET_PARAM':
@@ -122,11 +209,30 @@ export class AudioGraph
      */
     genSample()
     {
-        if (!this._genSample)
+        if (!this.current)
             return [0, 0];
 
         this.playPos += 1 / 44100;
-        return this._genSample(this.playPos, this.nodes);
+        return this.current.genSample(this.playPos, this.current.nodes);
+    }
+}
+
+/**
+ * Immutable snapshot of a compiled unit. Holds the sample generation
+ * function along with the audio nodes it references. Snapshots are
+ * built incrementally from the previous one and swapped atomically
+ * into the audio graph, so the graph never renders a half-updated
+ * state while playing.
+ */
+class AudioSnapshot
+{
+    constructor(nodes, genSample)
+    {
+        // Stateful audio processing nodes, indexed by nodeId
+        this.nodes = nodes;
+
+        // Compiled code to generate audio samples
+        this.genSample = genSample;
     }
 }
 
@@ -161,6 +267,18 @@ class AudioNode
     {
         this.state = state;
         this.params = state.params;
+    }
+
+    /**
+     * Release the resources and connections held by this node.
+     * Called when the node is discarded, e.g. when playback stops.
+     */
+    dispose()
+    {
+        // Detach the node from the audio graph
+        this.state = null;
+        this.params = null;
+        this.send = null;
     }
 }
 
